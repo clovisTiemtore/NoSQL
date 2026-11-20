@@ -86,6 +86,13 @@ les insertions passent par `create_products` par lots de 500 ; `seed.py` ne
 construit volontairement aucun index. C'est l'application qui le fait au
 démarrage.
 
+Le backend MongoDB utilise une seule collection `products` : `category` et
+`brand` y sont enregistrés directement sous forme de noms textuels. Les listes
+de catégories et de marques sont calculées à partir des produits existants ;
+ces entités ne sont donc pas conservées lorsqu'aucun produit ne les référence.
+Pour repartir du nouveau schéma après une ancienne installation, `--reset`
+supprime toute la base avant le nouvel ensemencement.
+
 
 ## Tests
 

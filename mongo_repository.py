@@ -1,30 +1,21 @@
-"""=== TO COMPLETE ===
-
-This file is the implementation gap: 15 of the 17 methods are stubs
-(``ensure_indexes`` is a deliberate no-op, ``create_products`` is provided).
-
-The ``InMemoryProductRepository`` in ``memory_repository.py`` is the reference
-behavior. Implement this repository on MongoDB.
-
-No application-level caching, no Python tricks: speed must come from the
-database.
-"""
+"""MongoDB backend for the product repository contract."""
 
 from __future__ import annotations
 
 import logging
+import re
+import uuid
 
-from pymongo import MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.collation import Collation
 
-from models import Brand, CatalogStats, Category, Product, ProductPage, ProductQuery
-from repository import ProductRepository
+from models import Brand, CatalogStats, Category, CategoryStats, Product, ProductPage, ProductQuery
+from repository import EntityNotFoundError, ProductRepository
 
 LOGGER = logging.getLogger(__name__)
 
-# The Mongo collection that holds products. A neutral contract detail: the
-# test fixtures and seeder import this to know where to clean up. Deliberately
-# NOT a performance hint (no mention of indexes, $text, keyset, projections).
-PRODUCT_COLLECTION_NAME = "product"
+PRODUCT_COLLECTION_NAME = "products"
+_SIMPLE_COLLATION = Collation(locale="simple")
 
 
 class MongoProductRepository(ProductRepository):
@@ -32,12 +23,8 @@ class MongoProductRepository(ProductRepository):
     ``InMemoryProductRepository``, implemented on MongoDB.
 
     ``__init__`` receives the URI and DB name from the factory; it does NOT
-    read environment variables. 15 of the 17 methods currently raise
-    ``NotImplementedError`` (``ensure_indexes`` is a deliberate no-op,
-    ``create_products`` is provided).
-
-    The member docstrings state the contract ONLY. They deliberately contain
-    NO hints about indexes, ``$text``, keyset pagination, or projections.
+    read environment variables. Product documents embed the current names of
+    their category and brand so each fetch returns a stable snapshot.
 
     Name matching follows the same convention: every name comparison is
     case-sensitive (``Books`` and ``books`` are two distinct entities); the
@@ -54,29 +41,77 @@ class MongoProductRepository(ProductRepository):
     def close(self) -> None:
         """Release backend resources. Called once at shutdown."""
         LOGGER.info("close()")
-        raise NotImplementedError("TODO: implement 'close' using MongoDB")
+        self._client.close()
+
+    @property
+    def _products(self):
+        return self._db[PRODUCT_COLLECTION_NAME]
+
+    @staticmethod
+    def _product_from_document(document: dict) -> Product:
+        category = document.get("category")
+        brand = document.get("brand")
+        return Product(
+            id=document["id"],
+            name=document["name"],
+            description=document["description"],
+            category=Category(id=f"category:{category}", name=category)
+            if category is not None
+            else None,
+            brand=Brand(id=f"brand:{brand}", name=brand) if brand is not None else None,
+            price=document["price"],
+            stock=document["stock"],
+            rating=document["rating"],
+            units_sold=document["units_sold"],
+            created_at=document["created_at"],
+        )
+
+    @staticmethod
+    def _product_document(
+        product: Product,
+        product_id: str,
+    ) -> dict:
+        return {
+            "id": product_id,
+            "name": product.name,
+            "description": product.description,
+            "category": product.category.name if product.category is not None else None,
+            "brand": product.brand.name if product.brand is not None else None,
+            "price": product.price,
+            "stock": product.stock,
+            "rating": product.rating,
+            "units_sold": product.units_sold,
+            "created_at": product.created_at,
+        }
 
     def create_product(self, product: Product) -> Product:
         """Create a single product.
 
-        The repository generates the product ``id`` (the placeholder carried
-        on ``product`` is replaced); a referenced category / brand is
-        auto-created on first sight of its name. Returns the stored product.
+        The repository generates the product ``id`` and stores category and
+        brand names directly in the product document.
         """
         LOGGER.info("create_product(%r, %s, %d)", product.name, product.price, product.stock)
-        raise NotImplementedError("TODO: implement 'create_product' using MongoDB")
+        document = self._product_document(product, uuid.uuid4().hex)
+        self._products.insert_one(document)
+        return self._product_from_document(document)
 
     def create_products(self, products: list[Product]) -> list[Product]:
         """Insert many products in one bulk call (the seed path).
 
         Each product ``id`` is generated by the repository, as in
-        ``create_product``. The referenced entities are created ONCE per name
-        for the whole batch. Returns the stored products in input order; an
+        ``create_product``. Category and brand names are stored as strings in
+        the product documents. Returns the stored products in input order; an
         empty input returns an empty list.
         """
         LOGGER.info("create_products(%d)", len(products))
-        # Not required immediately. Can be implemented later.
-        return [self.create_product(product) for product in products]
+        if not products:
+            return []
+        documents = [
+            self._product_document(product, uuid.uuid4().hex)
+            for product in products
+        ]
+        self._products.insert_many(documents)
+        return [self._product_from_document(document) for document in documents]
 
     def get_product(self, product_id: str) -> Product | None:
         """Return the product with ``product_id`` (entities materialized at fetch time).
@@ -84,7 +119,8 @@ class MongoProductRepository(ProductRepository):
         Never raises: an unknown or malformed id yields ``None``.
         """
         LOGGER.info("get_product(%r)", product_id)
-        raise NotImplementedError("TODO: implement 'get_product' using MongoDB")
+        document = self._products.find_one({"id": product_id})
+        return self._product_from_document(document) if document is not None else None
 
     def update_product(self, product: Product) -> Product:
         """Fully replace the mutable fields of the stored product targeted by ``product.id``.
@@ -92,13 +128,35 @@ class MongoProductRepository(ProductRepository):
         An unknown or malformed ``product.id`` raises
         ``repository.EntityNotFoundError``. The argument ``created_at`` is
         IGNORED: the stored value is kept. ``category`` / ``brand`` are
-        re-bound BY NAME: the argument entity ids are ignored, an unknown name
-        is auto-created, and ``None`` detaches the product from that entity.
+        stored by name; the argument entity ids are ignored, and ``None``
+        clears the corresponding field.
         The repository does NOT re-validate the fields: it trusts the typed
         product. Returns the updated product.
         """
         LOGGER.info("update_product(%r, %r)", product.id, product.name)
-        raise NotImplementedError("TODO: implement 'update_product' using MongoDB")
+        if self._products.find_one({"id": product.id}, {"id": 1}) is None:
+            raise EntityNotFoundError(f"product id {product.id!r} not found")
+        result = self._products.update_one(
+            {"id": product.id},
+            {
+                "$set": {
+                    "name": product.name,
+                    "description": product.description,
+                    "category": product.category.name if product.category is not None else None,
+                    "brand": product.brand.name if product.brand is not None else None,
+                    "price": product.price,
+                    "stock": product.stock,
+                    "rating": product.rating,
+                    "units_sold": product.units_sold,
+                }
+            },
+        )
+        if result.matched_count == 0:
+            raise EntityNotFoundError(f"product id {product.id!r} not found")
+        updated = self._products.find_one({"id": product.id})
+        if updated is None:
+            raise EntityNotFoundError(f"product id {product.id!r} not found")
+        return self._product_from_document(updated)
 
     def list_products(self, query: ProductQuery) -> ProductPage:
         """Filter, sort and paginate products according to ``query``.
@@ -109,7 +167,50 @@ class MongoProductRepository(ProductRepository):
         name or description. Ties on ``sort_field`` are broken by ``id`` ascending.
         """
         LOGGER.info("list_products(%r)", query)
-        raise NotImplementedError("TODO: implement 'list_products' using MongoDB")
+        filters: dict = {}
+        if query.category is not None:
+            filters["category"] = query.category
+        if query.brand is not None:
+            filters["brand"] = query.brand
+        if query.price_min is not None or query.price_max is not None:
+            filters["price"] = {}
+            if query.price_min is not None:
+                filters["price"]["$gte"] = query.price_min
+            if query.price_max is not None:
+                filters["price"]["$lte"] = query.price_max
+        if query.min_rating is not None:
+            filters["rating"] = {"$gte": query.min_rating}
+        if query.in_stock is True:
+            filters["stock"] = {"$gt": 0}
+        elif query.in_stock is False:
+            filters["stock"] = 0
+        if query.search_text is not None:
+            pattern = re.compile(re.escape(query.search_text), re.IGNORECASE)
+            filters["$or"] = [{"name": pattern}, {"description": pattern}]
+
+        page_size = max(1, min(100, query.page_size))
+        page = max(1, query.page)
+        total = self._products.count_documents(filters, collation=_SIMPLE_COLLATION)
+        cursor = (
+            self._products.find(filters, collation=_SIMPLE_COLLATION)
+            .sort(
+                [
+                    (query.sort_field, ASCENDING if query.sort_ascending else DESCENDING),
+                    ("id", ASCENDING),
+                ]
+            )
+            .skip((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = [self._product_from_document(document) for document in cursor]
+        total_pages = (total + page_size - 1) // page_size if total else 0
+        return ProductPage(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+        )
 
     def delete_product(self, product_id: str) -> None:
         """Delete the product with ``product_id``; returns ``None``.
@@ -117,7 +218,9 @@ class MongoProductRepository(ProductRepository):
         An unknown or malformed id raises ``repository.EntityNotFoundError``.
         """
         LOGGER.info("delete_product(%r)", product_id)
-        raise NotImplementedError("TODO: implement 'delete_product' using MongoDB")
+        result = self._products.delete_one({"id": product_id})
+        if result.deleted_count == 0:
+            raise EntityNotFoundError(f"product id {product_id!r} not found")
 
     def get_stats(self) -> CatalogStats:
         """Return whole-catalog statistics.
@@ -130,13 +233,91 @@ class MongoProductRepository(ProductRepository):
         ``by_category`` (they still count in ``total`` / ``average_price``).
         """
         LOGGER.info("get_stats()")
-        raise NotImplementedError("TODO: implement 'get_stats' using MongoDB")
+        totals = list(
+            self._products.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total": {"$sum": 1},
+                            "average_price": {"$avg": "$price"},
+                        }
+                    }
+                ]
+            )
+        )
+        if not totals:
+            return CatalogStats(total=0, average_price=0.0, by_category={})
+
+        category_groups = self._products.aggregate(
+            [
+                {"$match": {"category": {"$type": "string"}}},
+                {
+                    "$group": {
+                        "_id": "$category",
+                        "count": {"$sum": 1},
+                        "average_price": {"$avg": "$price"},
+                        "total_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
+                    }
+                },
+                {"$sort": {"_id": ASCENDING}},
+            ],
+            collation=_SIMPLE_COLLATION,
+        )
+        by_category = {
+            group["_id"]: CategoryStats(
+                count=group["count"],
+                average_price=group["average_price"],
+                total_value=group["total_value"],
+            )
+            for group in category_groups
+        }
+        return CatalogStats(
+            total=totals[0]["total"],
+            average_price=totals[0]["average_price"],
+            by_category=by_category,
+        )
 
     def ensure_indexes(self) -> None:
         """Ensure backend indexes exist. Idempotent."""
         LOGGER.info("ensure_indexes()")
-        # Not required immediately. Can be implemented later.
-        pass
+        products = self._products
+        products.create_index([("id", ASCENDING)], unique=True, name="product_id_unique")
+        existing_indexes = products.index_information()
+        for obsolete_index in (
+            "product_category_id",
+            "product_brand_id",
+            "product_category_name",
+            "product_brand_name",
+        ):
+            if obsolete_index in existing_indexes:
+                products.drop_index(obsolete_index)
+        products.create_index(
+            [("category", ASCENDING)],
+            name="product_category",
+            collation=_SIMPLE_COLLATION,
+        )
+        products.create_index(
+            [("brand", ASCENDING)],
+            name="product_brand",
+            collation=_SIMPLE_COLLATION,
+        )
+        products.create_index([("name", ASCENDING)], name="product_name_search")
+        products.create_index([("description", ASCENDING)], name="product_description_search")
+        products.create_index([("price", ASCENDING)], name="product_price")
+        products.create_index([("rating", ASCENDING)], name="product_rating")
+        products.create_index([("stock", ASCENDING)], name="product_stock")
+        for field in ("name", "price", "rating", "units_sold", "created_at"):
+            products.create_index(
+                [(field, ASCENDING), ("id", ASCENDING)],
+                name=f"product_sort_{field}_asc",
+                collation=_SIMPLE_COLLATION,
+            )
+            products.create_index(
+                [(field, DESCENDING), ("id", ASCENDING)],
+                name=f"product_sort_{field}_desc",
+                collation=_SIMPLE_COLLATION,
+            )
 
     def list_categories(self) -> list[Category]:
         """Return every category, sorted by name ascending (codepoint order).
@@ -145,7 +326,12 @@ class MongoProductRepository(ProductRepository):
         unknown name.
         """
         LOGGER.info("list_categories()")
-        raise NotImplementedError("TODO: implement 'list_categories' using MongoDB")
+        names = self._products.distinct(
+            "category",
+            {"category": {"$type": "string"}},
+            collation=_SIMPLE_COLLATION,
+        )
+        return [Category(id=f"category:{name}", name=name) for name in sorted(names)]
 
     def get_category(self, category_id: str) -> Category | None:
         """Return the category with ``category_id`` or ``None``.
@@ -154,7 +340,13 @@ class MongoProductRepository(ProductRepository):
         are created implicitly when products are saved with an unknown name.
         """
         LOGGER.info("get_category(%r)", category_id)
-        raise NotImplementedError("TODO: implement 'get_category' using MongoDB")
+        prefix = "category:"
+        if not isinstance(category_id, str) or not category_id.startswith(prefix):
+            return None
+        name = category_id[len(prefix) :]
+        if self._products.find_one({"category": name}, {"id": 1}) is None:
+            return None
+        return Category(id=category_id, name=name)
 
     def rename_category(self, category_id: str, new_name: str) -> Category:
         """Rename the category; ``new_name`` is trimmed.
@@ -168,7 +360,17 @@ class MongoProductRepository(ProductRepository):
         Returns the renamed entity.
         """
         LOGGER.info("rename_category(%r, %r)", category_id, new_name)
-        raise NotImplementedError("TODO: implement 'rename_category' using MongoDB")
+        category = self.get_category(category_id)
+        if category is None:
+            raise EntityNotFoundError(f"category id {category_id!r} not found")
+        trimmed = new_name.strip()
+        if category.name == trimmed:
+            return category
+        self._products.update_many(
+            {"category": category.name},
+            {"$set": {"category": trimmed}},
+        )
+        return Category(id=f"category:{trimmed}", name=trimmed)
 
     def delete_category(self, category_id: str) -> int:
         """Delete the category; returns the number of products affected.
@@ -180,7 +382,15 @@ class MongoProductRepository(ProductRepository):
         category.
         """
         LOGGER.info("delete_category(%r)", category_id)
-        raise NotImplementedError("TODO: implement 'delete_category' using MongoDB")
+        prefix = "category:"
+        if not isinstance(category_id, str) or not category_id.startswith(prefix):
+            raise EntityNotFoundError(f"category id {category_id!r} not found")
+        name = category_id[len(prefix) :]
+        affected = self._products.update_many(
+            {"category": name},
+            {"$set": {"category": None}},
+        ).modified_count
+        return affected
 
     def list_brands(self) -> list[Brand]:
         """Return every brand, sorted by name ascending (codepoint order).
@@ -189,7 +399,12 @@ class MongoProductRepository(ProductRepository):
         name.
         """
         LOGGER.info("list_brands()")
-        raise NotImplementedError("TODO: implement 'list_brands' using MongoDB")
+        names = self._products.distinct(
+            "brand",
+            {"brand": {"$type": "string"}},
+            collation=_SIMPLE_COLLATION,
+        )
+        return [Brand(id=f"brand:{name}", name=name) for name in sorted(names)]
 
     def get_brand(self, brand_id: str) -> Brand | None:
         """Return the brand with ``brand_id`` or ``None``.
@@ -198,7 +413,13 @@ class MongoProductRepository(ProductRepository):
         created implicitly when products are saved with an unknown name.
         """
         LOGGER.info("get_brand(%r)", brand_id)
-        raise NotImplementedError("TODO: implement 'get_brand' using MongoDB")
+        prefix = "brand:"
+        if not isinstance(brand_id, str) or not brand_id.startswith(prefix):
+            return None
+        name = brand_id[len(prefix) :]
+        if self._products.find_one({"brand": name}, {"id": 1}) is None:
+            return None
+        return Brand(id=brand_id, name=name)
 
     def rename_brand(self, brand_id: str, new_name: str) -> Brand:
         """Rename the brand; ``new_name`` is trimmed.
@@ -212,7 +433,17 @@ class MongoProductRepository(ProductRepository):
         the renamed entity.
         """
         LOGGER.info("rename_brand(%r, %r)", brand_id, new_name)
-        raise NotImplementedError("TODO: implement 'rename_brand' using MongoDB")
+        brand = self.get_brand(brand_id)
+        if brand is None:
+            raise EntityNotFoundError(f"brand id {brand_id!r} not found")
+        trimmed = new_name.strip()
+        if brand.name == trimmed:
+            return brand
+        self._products.update_many(
+            {"brand": brand.name},
+            {"$set": {"brand": trimmed}},
+        )
+        return Brand(id=f"brand:{trimmed}", name=trimmed)
 
     def delete_brand(self, brand_id: str) -> int:
         """Delete the brand; returns the number of products affected.
@@ -224,4 +455,12 @@ class MongoProductRepository(ProductRepository):
         brand.
         """
         LOGGER.info("delete_brand(%r)", brand_id)
-        raise NotImplementedError("TODO: implement 'delete_brand' using MongoDB")
+        prefix = "brand:"
+        if not isinstance(brand_id, str) or not brand_id.startswith(prefix):
+            raise EntityNotFoundError(f"brand id {brand_id!r} not found")
+        name = brand_id[len(prefix) :]
+        affected = self._products.update_many(
+            {"brand": name},
+            {"$set": {"brand": None}},
+        ).modified_count
+        return affected

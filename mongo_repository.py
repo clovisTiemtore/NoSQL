@@ -233,49 +233,54 @@ class MongoProductRepository(ProductRepository):
         ``by_category`` (they still count in ``total`` / ``average_price``).
         """
         LOGGER.info("get_stats()")
-        totals = list(
-            self._products.aggregate(
-                [
-                    {
-                        "$group": {
-                            "_id": None,
-                            "total": {"$sum": 1},
-                            "average_price": {"$avg": "$price"},
-                        }
-                    }
-                ]
-            )
-        )
-        if not totals:
-            return CatalogStats(total=0, average_price=0.0, by_category={})
-
-        category_groups = self._products.aggregate(
-            [
-                {"$match": {"category": {"$type": "string"}}},
-                {
-                    "$group": {
-                        "_id": "$category",
-                        "count": {"$sum": 1},
-                        "average_price": {"$avg": "$price"},
-                        "total_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
-                    }
+        pipeline = [
+            {
+                "$facet": {
+                    "totals": [
+                        {
+                            "$group": {
+                                "_id": None,
+                                "total": {"$sum": 1},
+                                "average_price": {"$avg": "$price"},
+                            }
+                        },
+                    ],
+                    "by_category": [
+                        {"$match": {"category": {"$type": "string"}}},
+                        {
+                            "$group": {
+                                "_id": "$category",
+                                "count": {"$sum": 1},
+                                "average_price": {"$avg": "$price"},
+                                "total_value": {"$sum": {"$multiply": ["$price", "$stock"]}},
+                            }
+                        },
+                        {"$sort": {"_id": ASCENDING}},
+                    ],
                 },
-                {"$sort": {"_id": ASCENDING}},
-            ],
-            collation=_SIMPLE_COLLATION,
-        )
-        by_category = {
-            group["_id"]: CategoryStats(
+            },
+            {
+                "$project": {
+                    "total": {"$ifNull": [{"$first": "$totals.total"}, 0]},
+                    "average_price": {"$ifNull": [{"$first": "$totals.average_price"}, 0.0]},
+                    "by_category": 1,
+                },
+            },
+        ]
+        with self._products.aggregate(pipeline, collation=_SIMPLE_COLLATION) as cursor:
+            result = next(cursor)
+
+        def category_entry(group: dict) -> tuple[str, CategoryStats]:
+            return group["_id"], CategoryStats(
                 count=group["count"],
                 average_price=group["average_price"],
                 total_value=group["total_value"],
             )
-            for group in category_groups
-        }
+
         return CatalogStats(
-            total=totals[0]["total"],
-            average_price=totals[0]["average_price"],
-            by_category=by_category,
+            total=result["total"],
+            average_price=result["average_price"],
+            by_category=dict(map(category_entry, result["by_category"])),
         )
 
     def ensure_indexes(self) -> None:
